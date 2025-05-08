@@ -5,10 +5,13 @@ This module provides dataset and dataloader implementations for training
 GPT-like models using a sliding window approach for next token prediction.
 """
 
+import json
 import os
 
+import numpy as np
 import tiktoken
 import torch
+from tqdm import tqdm
 
 DEFAULT_GPT_DATALOADER_CONFIG = {
     'batch_size': 4,
@@ -99,11 +102,14 @@ def create_gpt_dataloader_v1(txt, config=DEFAULT_GPT_DATALOADER_CONFIG):
                            config['stride'])
 
     # Create dataloader
-    dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=config['batch_size'],
-                                             shuffle=config['shuffle'],
-                                             drop_last=config['drop_last'],
-                                             num_workers=config['num_workers'])
+    persistent_workers = config['num_workers'] > 0
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=config['shuffle'],
+        drop_last=config['drop_last'],
+        num_workers=config['num_workers'],
+        persistent_workers=persistent_workers)
 
     return dataloader
 
@@ -383,10 +389,187 @@ def create_gpt_dataloader_v2(file_paths,
                            cache_size=cache_size)
 
     # Create dataloader
-    dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=config['batch_size'],
-                                             shuffle=config['shuffle'],
-                                             drop_last=config['drop_last'],
-                                             num_workers=config['num_workers'])
+    persistent_workers = config['num_workers'] > 0
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=config['shuffle'],
+        drop_last=config['drop_last'],
+        num_workers=config['num_workers'],
+        persistent_workers=persistent_workers)
+
+    return dataloader
+
+
+# Like GPTDatasetV1, but for multiple text files.
+def preprocess_txt_files_to_bin(train_file_paths, val_file_paths, tokenizer,
+                                max_length, stride, output_dir):
+    """
+    Preprocess multiple text files into binary format for efficient training.
+
+    Args:
+        train_file_paths: List of paths to training text files
+        val_file_paths: List of paths to validation text files
+        tokenizer: Tokenizer to use for encoding
+        max_length: Maximum sequence length
+        stride: Stride for sliding window
+        output_dir: Directory to save binary files
+    """
+    dtype = np.uint16  # GPT2 vocab_size 50257 is < 2**16
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    def load_txt(file_path):
+        """Helper function to load text from a file."""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def process_files(file_paths, output_filename):
+        """Helper function to process a list of files into a binary file."""
+        # First pass: calculate total number of sequences
+        total_sequences = 0
+        for file_path in tqdm(file_paths, desc="Counting sequences"):
+            txt = load_txt(file_path)
+            token_ids = tokenizer.encode(txt,
+                                         allowed_special={"<|endoftext|>"})
+            # Calculate how many sequences this file will produce
+            if len(token_ids) >= max_length:
+                total_sequences += (len(token_ids) - max_length) // stride + 1
+
+        if total_sequences == 0:
+            raise ValueError(
+                "No sequences generated - check your input files and parameters"
+            )
+
+        # Initialize memory-mapped array
+        output_shape = (total_sequences, max_length)
+        arr = np.memmap(os.path.join(output_dir, output_filename),
+                        dtype=dtype,
+                        mode='w+',
+                        shape=output_shape)
+
+        # Second pass: actually process and save the data
+        seq_idx = 0
+        for file_path in tqdm(file_paths, desc="Processing files"):
+            txt = load_txt(file_path)
+            token_ids = tokenizer.encode(txt,
+                                         allowed_special={"<|endoftext|>"})
+
+            # Generate sequences with sliding window
+            for i in range(0, len(token_ids) - max_length + 1, stride):
+                chunk = token_ids[i:i + max_length]
+                arr[seq_idx] = chunk
+                seq_idx += 1
+
+        # Flush changes to disk
+        arr.flush()
+        del arr
+        return total_sequences
+
+    # Process training and validation files
+    print("Processing training files...")
+    train_seq_num = process_files(train_file_paths, "train.bin")
+
+    print("Processing validation files...")
+    val_seq_num = process_files(val_file_paths, "val.bin")
+
+    bin_data_meta_json_filepath = os.path.join(output_dir,
+                                               "bin_data_meta.json")
+    meta_info = {
+        "description": "Preprocessed binary data for GPT training",
+        "train_file_paths": train_file_paths,
+        "val_file_paths": val_file_paths,
+        "output_dir": output_dir,
+        "max_length": max_length,
+        "stride": stride,
+        "dtype": str(dtype),
+        "train_file": "train.bin",
+        "val_file": "val.bin",
+        "train_seq_num": train_seq_num,
+        "val_seq_num": val_seq_num,
+        "tokenizer_name": tokenizer.name,
+    }
+    with open(bin_data_meta_json_filepath, 'w') as f:
+        json.dump(meta_info, f, indent=4)
+
+
+class GPTDatasetBinary(torch.utils.data.Dataset):
+    """Dataset that reads from preprocessed binary files."""
+
+    def __init__(self, bin_file_path, max_length):
+        self.data = np.memmap(bin_file_path, dtype=np.uint16, mode='r')
+        self.max_length = max_length
+        # Reshape to (num_sequences, max_length)
+        self.num_sequences = len(self.data) // max_length
+        self.data = self.data.reshape((self.num_sequences, max_length))
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, idx):
+        # Input is all tokens except last, target is all tokens except first
+        x = torch.from_numpy(self.data[idx][:-1].astype(np.int64))
+        y = torch.from_numpy(self.data[idx][1:].astype(np.int64))
+        return x, y
+
+
+def create_gpt_bin_dataloader(bin_file_path,
+                              config=DEFAULT_GPT_DATALOADER_CONFIG):
+    # Create dataset
+    dataset = GPTDatasetBinary(bin_file_path, config['max_length'])
+
+    # Create dataloader
+    persistent_workers = config['num_workers'] > 0
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=config['shuffle'],
+        drop_last=config['drop_last'],
+        num_workers=config['num_workers'],
+        persistent_workers=persistent_workers)
+
+    return dataloader
+
+
+class GPTDatasetBinaryV2(torch.utils.data.Dataset):
+    """Dataset that reads from preprocessed binary files."""
+
+    def __init__(self, bin_file_path, max_length):
+        self.bin_file_path = bin_file_path
+        self.max_length = max_length
+
+        arr = np.memmap(bin_file_path, dtype=np.uint16, mode='r')
+        self.num_sequences = len(arr) // max_length
+        del arr
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, idx):
+        arr = np.memmap(self.bin_file_path, dtype=np.uint16, mode='r')
+        arr = arr.reshape((self.num_sequences, self.max_length))
+
+        sequence = arr[idx]
+
+        x = torch.from_numpy(sequence[:-1].astype(np.int64))
+        y = torch.from_numpy(sequence[1:].astype(np.int64))
+        return x, y
+
+
+def create_gpt_bin_dataloader_v2(bin_file_path,
+                                 config=DEFAULT_GPT_DATALOADER_CONFIG):
+    # Create dataset
+    dataset = GPTDatasetBinaryV2(bin_file_path, config['max_length'])
+
+    # Create dataloader
+    persistent_workers = config['num_workers'] > 0
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=config['shuffle'],
+        drop_last=config['drop_last'],
+        num_workers=config['num_workers'],
+        persistent_workers=persistent_workers)
 
     return dataloader

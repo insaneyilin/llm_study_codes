@@ -2,3 +2,5 @@ tools/gpt2_model_ckpts/
 data/gutenberg_raw/
 data/gutenberg_processed/
 gutenberg/
+lightning_logs/
+checkpoints/
