@@ -127,12 +127,14 @@ class LightningGPT2SpamClassifier(pl.LightningModule):
             "one_epoch_steps"]
 
         # OneCycleLR with warmup (first 10% of steps are for warmup)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=self.train_cfg["learning_rate"],
-            total_steps=total_steps,
-            pct_start=0.1,  # 10% of training for warmup
-            anneal_strategy='cos')
+        # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     optimizer,
+        #     max_lr=self.train_cfg["learning_rate"],
+        #     total_steps=total_steps,
+        #     pct_start=0.1,  # 10% of training for warmup
+        #     anneal_strategy='cos')
+
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
         return {
             "optimizer": optimizer,
